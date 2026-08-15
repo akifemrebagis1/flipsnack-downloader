@@ -5,10 +5,11 @@ A Python tool that downloads all pages from any [Flipsnack](https://www.flipsnac
 ## ✨ Features
 
 - 🔓 **Automatic signature extraction** — handles CloudFront signed URLs transparently
-- 📄 **Downloads all pages** — automatically detects the total number of pages
+- 🔁 **Signature auto-refresh** — CloudFront signatures are short-lived; expired ones are renewed mid-download
+- 📄 **Downloads all pages** — reads the real page list from the publication's `data.json`
 - 🖼️ **Original quality** — saves images in their original resolution (JPG/PNG)
 - 🍪 **Cookie consent handling** — dismisses popups automatically
-- 🛡️ **Robust error handling** — retries and graceful failure detection
+- 🛡️ **Robust error handling** — per-page retry, failure summary, legacy-format fallback
 
 ## 📋 Requirements
 
@@ -52,14 +53,28 @@ python flipsnack_downloader.py
 │  1. Launch Chrome via Selenium                          │
 │  2. Navigate to the Flipsnack full-view page            │
 │  3. Switch into the player iframe                       │
-│  4. Extract the signed CloudFront URL from the DOM      │
-│  5. Replace the page number in the URL (page_1 → page_N)│
-│  6. Download all pages sequentially via HTTP             │
-│  7. Stop when consecutive 403 errors are detected       │
+│  4. Read the signed CloudFront collection URL the       │
+│     player loaded (signature + policy + key-pair id)    │
+│  5. Fetch data.json → the ordered list of page IDs      │
+│  6. Download every page at /covers/<id>/original        │
+│  7. Refresh the signature if it expires mid-download    │
 └─────────────────────────────────────────────────────────┘
 ```
 
-Flipsnack uses **CloudFront signed URLs** to protect content. The signature, policy, and key-pair parameters are embedded in the image URLs loaded by the player. This tool extracts a valid signed URL from the first page, then reuses the same signature to download all remaining pages — since the CloudFront policy grants access to all resources within the same collection path.
+Flipsnack uses **CloudFront signed URLs** to protect content. The signature, policy, and key-pair parameters are embedded in every request the player makes. This tool extracts a valid signed query string, then reuses it for all pages — the CloudFront policy is a wildcard granting access to everything under the same collection path.
+
+### Why page numbers aren't enough
+
+Page images are **not** numbered sequentially in the URL. Each page has its own random ID:
+
+```
+https://<cdn>/<account>/collections/<hash>/covers/sb5-NU4WNmbcGMBi/original?Signature=...
+                                            ^^^^^^^^^^^^^^^^^^^^^^ random, per page
+```
+
+So the page list cannot be guessed by incrementing a counter — it has to come from the publication's `data.json`, where `pages.order` holds the page IDs in reading order. Older publications that still use `/page_N/` paths are handled by a legacy fallback.
+
+The signed URL is also **short-lived** — its policy carries a `DateLessThan` expiry, and once that passes every request returns `403 AccessDenied`. When that happens mid-download, the tool reloads the player in the still-open browser session to mint a fresh signature and continues.
 
 ## 📁 Output
 
@@ -85,23 +100,35 @@ flipsnack_pages/
 
   Chrome baslatiliyor...
   Flipsnack sayfasi aciliyor...
+  Player iframe araniyor...
   Player iframe bulundu: https://player.flipsnack.com/?hash=...
+  Imzali koleksiyon URL'si araniyor...
   Imzali URL bulundu: https://d3u72tnj701eui.cloudfront.net/...
+  Sayfa listesi (data.json) aliniyor...
+  Toplam 61 sayfa bulundu
 
   Indirme basliyor -> flipsnack_pages
 
-  [OK]  Sayfa   1 indirildi (746 KB)
-  [OK]  Sayfa   2 indirildi (393 KB)
-  [OK]  Sayfa   3 indirildi (381 KB)
+  [OK]  Sayfa   1/61 indirildi (854 KB)
+  [OK]  Sayfa   2/61 indirildi (393 KB)
+  [OK]  Sayfa   3/61 indirildi (381 KB)
   ...
-  [--]  Sayfa  64: 403 - sayfa mevcut degil
-  [--]  Sayfa  65 de 403 - son sayfa bulundu
+  [OK]  Sayfa  61/61 indirildi (693 KB)
 
 =======================================================
-  Tamamlandi! 63 sayfa indirildi
+  Tamamlandi! 61/61 sayfa indirildi
   Klasor: C:\...\flipsnack_pages
 =======================================================
 ```
+
+## 🩺 Troubleshooting
+
+| Message | Cause / fix |
+|---|---|
+| `HATA: Imzali URL bulunamadi!` | The player never loaded a signed request — the publication may be private, password-protected, or the page didn't finish loading. Try again, or check that the URL opens normally in a browser. |
+| `HATA: iframe bulunamadi!` | The page didn't render the player. Usually a slow network or a cookie wall — rerun the script. |
+| `403` on every page | The CloudFront signature expired. The tool refreshes it automatically; if it still fails, the publication's access policy changed. |
+| `HATA: data.json icinde sayfa bulunamadi!` | The publication has no page list (empty or non-flipbook content type). |
 
 ## ⚠️ Disclaimer
 
