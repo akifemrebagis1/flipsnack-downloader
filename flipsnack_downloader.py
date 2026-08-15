@@ -44,6 +44,10 @@ from selenium.webdriver.chrome.options import Options
 # group(1) = collection base URL, group(2) = signed query string
 COLLECTION_RE = re.compile(r'(https://[^?]*?/collections/[^/?]+)/[^?]*\?(.+)')
 
+# Transient network failures (DNS hiccups, resets) get retried locally.
+NETWORK_RETRIES = 3
+RETRY_BACKOFF = 3  # seconds, multiplied by the attempt number
+
 # JS run inside the player iframe: every URL the player has loaded, plus the
 # <img> sources currently in the DOM.
 COLLECT_URLS_JS = """
@@ -92,6 +96,44 @@ def make_session():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"
     })
     return session
+
+
+def short_error(exc):
+    """Condense a requests exception into one printable line.
+
+    Raw requests errors embed the whole signed URL, which floods the console.
+    """
+    text = str(exc)
+    if "getaddrinfo failed" in text or "NameResolutionError" in text:
+        return "DNS cozumlenemedi"
+    if "timed out" in text.lower() or "ReadTimeout" in text:
+        return "zaman asimi"
+    if "Connection aborted" in text or "ConnectionReset" in text:
+        return "baglanti kesildi"
+    if "SSLError" in text:
+        return "SSL hatasi"
+    return f"{type(exc).__name__}"
+
+
+def get_with_retry(session, url, timeout=60, retries=NETWORK_RETRIES, label=""):
+    """GET with retries for transient network failures (DNS blips, resets).
+
+    Network problems are separate from signature problems: reloading the
+    browser cannot fix a DNS failure, so those are simply retried here.
+    Raises the last requests exception if every attempt fails.
+    """
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            return session.get(url, timeout=timeout)
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < retries:
+                wait = RETRY_BACKOFF * attempt
+                print(f"  [..]  {label}Ag hatasi ({short_error(exc)}), "
+                      f"{wait}s sonra tekrar deneniyor ({attempt}/{retries - 1})...")
+                time.sleep(wait)
+    raise last_exc
 
 
 def ascii_safe(text):
@@ -172,16 +214,31 @@ def parse_collection_url(url):
     return match.group(1), match.group(2)
 
 
-def fetch_page_ids(base_url, query, session):
-    """Fetch data.json and return (page_ids, title)."""
-    resp = session.get(f"{base_url}/data.json?{query}", timeout=30)
+def fetch_page_ids(base_url, query, session, refresh=None):
+    """Fetch data.json and return (page_ids, title, query).
+
+    Only a rejected signature (403) triggers a refresh — network errors are
+    already retried by ``get_with_retry``. The query is returned because a
+    refresh replaces it, and the page downloads need the fresh one.
+    """
+    url = f"{base_url}/data.json?{query}"
+    resp = get_with_retry(session, url, timeout=30, label="data.json: ")
+
+    if resp.status_code == 403 and refresh:
+        print("  data.json 403 - imza suresi dolmus, yenileniyor...")
+        new_query = refresh()
+        if new_query:
+            query = new_query
+            resp = get_with_retry(session, f"{base_url}/data.json?{query}",
+                                  timeout=30, label="data.json: ")
+
     resp.raise_for_status()
     data = resp.json()
 
     pages = data.get("pages") or {}
     page_ids = pages.get("order") or []
     title = (data.get("properties") or {}).get("title") or ""
-    return page_ids, title
+    return page_ids, title, query
 
 
 def download_all_pages(base_url, query, page_ids, output_dir, session, refresh=None):
@@ -199,39 +256,41 @@ def download_all_pages(base_url, query, page_ids, output_dir, session, refresh=N
     failed = []
 
     for index, page_id in enumerate(page_ids, start=1):
-        for attempt in (1, 2):
-            try:
-                resp = session.get(
-                    f"{base_url}/covers/{page_id}/original?{query}", timeout=60
-                )
-            except Exception as exc:
-                print(f"  [XX]  Sayfa {index:3d}: Hata - {exc}")
-                failed.append(index)
-                break
+        label = f"Sayfa {index}: "
+        try:
+            resp = get_with_retry(
+                session, f"{base_url}/covers/{page_id}/original?{query}", label=label
+            )
 
             # Expired signature: pull a fresh one from the live browser session.
-            if resp.status_code == 403 and attempt == 1 and refresh:
+            if resp.status_code == 403 and refresh:
                 print(f"  [..]  Sayfa {index:3d}: imza suresi doldu, yenileniyor...")
                 new_query = refresh()
                 if new_query:
                     query = new_query
-                    continue
+                    resp = get_with_retry(
+                        session, f"{base_url}/covers/{page_id}/original?{query}",
+                        label=label
+                    )
+        except requests.RequestException as exc:
+            print(f"  [XX]  Sayfa {index:3d}: {short_error(exc)}")
+            failed.append(index)
+            continue
 
-            if resp.status_code == 200 and len(resp.content) > 1000:
-                ct = resp.headers.get("Content-Type", "")
-                ext = ".png" if "png" in ct else ".jpg"
-                filepath = os.path.join(output_dir, f"page_{index:0{width}d}{ext}")
+        if resp.status_code == 200 and len(resp.content) > 1000:
+            ct = resp.headers.get("Content-Type", "")
+            ext = ".png" if "png" in ct else ".jpg"
+            filepath = os.path.join(output_dir, f"page_{index:0{width}d}{ext}")
 
-                with open(filepath, "wb") as f:
-                    f.write(resp.content)
+            with open(filepath, "wb") as f:
+                f.write(resp.content)
 
-                downloaded += 1
-                print(f"  [OK]  Sayfa {index:3d}/{total} indirildi "
-                      f"({len(resp.content) // 1024} KB)")
-            else:
-                print(f"  [XX]  Sayfa {index:3d}: HTTP {resp.status_code}")
-                failed.append(index)
-            break
+            downloaded += 1
+            print(f"  [OK]  Sayfa {index:3d}/{total} indirildi "
+                  f"({len(resp.content) // 1024} KB)")
+        else:
+            print(f"  [XX]  Sayfa {index:3d}: HTTP {resp.status_code}")
+            failed.append(index)
 
     if failed:
         print(f"\n  UYARI: {len(failed)} sayfa indirilemedi: "
@@ -251,7 +310,8 @@ def download_legacy_numbered_pages(base_url, output_dir, session, max_pages=200)
         page_url = re.sub(r'/page_\d+/', f'/page_{page_num}/', base_url, count=1)
 
         try:
-            resp = session.get(page_url, timeout=30)
+            resp = get_with_retry(session, page_url, timeout=30,
+                                  label=f"Sayfa {page_num}: ")
 
             if resp.status_code == 200 and len(resp.content) > 1000:
                 ct = resp.headers.get("Content-Type", "")
@@ -269,15 +329,15 @@ def download_legacy_numbered_pages(base_url, output_dir, session, max_pages=200)
                 print(f"  [--]  Sayfa {page_num}: 403 - sayfa mevcut degil")
                 next_url = re.sub(r'/page_\d+/', f'/page_{page_num + 1}/',
                                   base_url, count=1)
-                if session.get(next_url, timeout=10).status_code == 403:
+                if get_with_retry(session, next_url, timeout=10).status_code == 403:
                     print(f"  [--]  Sayfa {page_num + 1} de 403 - son sayfa bulundu")
                     break
             else:
                 print(f"  [XX]  Sayfa {page_num}: HTTP {resp.status_code}")
                 break
 
-        except Exception as exc:
-            print(f"  [XX]  Sayfa {page_num}: Hata - {exc}")
+        except requests.RequestException as exc:
+            print(f"  [XX]  Sayfa {page_num}: {short_error(exc)}")
             break
 
     return downloaded
@@ -346,15 +406,16 @@ def main():
 
         print("  Sayfa listesi (data.json) aliniyor...")
         try:
-            page_ids, title = fetch_page_ids(base_url, query, session)
-        except Exception as exc:
-            print(f"  data.json alinamadi ({exc}), imza yenileniyor...")
-            new_query = refresh_query()
-            if not new_query:
-                print("  HATA: Imza yenilenemedi!")
-                return
-            query = new_query
-            page_ids, title = fetch_page_ids(base_url, query, session)
+            page_ids, title, query = fetch_page_ids(
+                base_url, query, session, refresh=refresh_query
+            )
+        except requests.RequestException as exc:
+            print(f"  HATA: Sayfa listesi alinamadi - {short_error(exc)}")
+            print("  Internet baglantinizi kontrol edip tekrar deneyin.")
+            return
+        except ValueError:
+            print("  HATA: data.json cozumlenemedi (beklenmeyen icerik)")
+            return
 
         if not page_ids:
             print("  HATA: data.json icinde sayfa bulunamadi!")
@@ -378,4 +439,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n  Iptal edildi.")
+        sys.exit(130)
+    except Exception as exc:
+        print(f"\n  HATA: {type(exc).__name__} - {short_error(exc)}")
+        sys.exit(1)

@@ -128,6 +128,8 @@ flipsnack_pages/
 | `HATA: Imzali URL bulunamadi!` | The player never loaded a signed request — the publication may be private, password-protected, or the page didn't finish loading. Try again, or check that the URL opens normally in a browser. |
 | `HATA: iframe bulunamadi!` | The page didn't render the player. Usually a slow network or a cookie wall — rerun the script. |
 | `403` on every page | The CloudFront signature expired. The tool refreshes it automatically; if it still fails, the publication's access policy changed. |
+| `Ag hatasi (DNS cozumlenemedi)` | Transient DNS/network failure — Chrome may resolve the CDN from its cache while Python cannot. Each request is retried automatically; if it persists, check your DNS/VPN. |
+| `HATA: Sayfa listesi alinamadi` | The CDN stayed unreachable across all retries. A connectivity problem, not a signature one — rerun once the network is back. |
 | `HATA: data.json icinde sayfa bulunamadi!` | The publication has no page list (empty or non-flipbook content type). |
 
 ## ⚠️ Disclaimer
